@@ -35,10 +35,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 DynamicUser=yes
-WorkingDirectory=/opt/grindr-cascade
+WorkingDirectory=/opt/grindr-always-online
 EnvironmentFile=/etc/grindr-always-online/.env
-Environment="GRINDR_DATA_DIR=/var/lib/grindr-cascade"
-ExecStart=/opt/grindr-cascade/grindr-cascade
+Environment="GRINDR_DATA_DIR=/var/lib/grindr-always-online"
+ExecStart=/opt/grindr-always-online/grindr-always-online
 
 Restart=always
 RestartSec=30
@@ -47,7 +47,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/grindr-cascade
+ReadWritePaths=/var/lib/grindr-always-online
 
 [Install]
 WantedBy=multi-user.target
@@ -63,7 +63,7 @@ cargo run --release -- once  # fire a single request and exit
 The login session and device identity are cached in `session.json` and
 `device.json` in the data directory, so it only logs in on the first run.
 
-## License
+## Licenseч
 
 [MIT](./LICENSE)
 
