@@ -1,4 +1,6 @@
+.DS_Store
 /target
+dist
 .env
 device.json
 session.json
