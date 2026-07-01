@@ -1,6 +1,6 @@
 # grindr-always-online
 
-Rust script that keeps a Grindr account always "online" by sending a `GET /v4/cascade` request at random intervals (2–15 min apart). Powered by [grindr.rs](https://git.opengrind.org/open-grind/grindr.rs).
+Rust script that keeps a Grindr account always "online" by sending a `GET /v4/cascade` request at random intervals (2–15 min apart). Automatically changes location by ~5m each request to improve grid rankings. Powered by [grindr.rs](https://git.opengrind.org/open-grind/grindr.rs).
 
 ## Configure
 

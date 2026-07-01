@@ -5,19 +5,23 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use geohash::Coord;
 use grindr::{DeviceInfo, GrindrClient, Method, Session};
 
 const MIN_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const MAX_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+const JIGGLE_METERS: f64 = 5.0;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = data_dir()?;
     ensure_data_dir(&data_dir)?;
 
-    let geohash = std::env::var("GRINDR_GEOHASH").map_err(|_| "set GRINDR_GEOHASH")?;
-
-    let cascade_query = format!("nearbyGeoHash={geohash}");
+    let base_geohash = std::env::var("GRINDR_GEOHASH")
+        .ok()
+        .filter(|g| !g.trim().is_empty())
+        .ok_or("set GRINDR_GEOHASH")?;
 
     let device = load_device(&data_dir).unwrap_or_else(|| {
         let d = DeviceInfo::generate();
@@ -47,6 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let once = std::env::args().any(|a| a == "once");
 
     loop {
+        let cascade_query = jiggled_query(&base_geohash);
+
         match run_cascade(&client, &cascade_query).await {
             Ok(()) => {}
             Err(e) => eprintln!("[{}] request failed: {e}", unix_now()),
@@ -69,6 +75,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn jiggled_query(base_geohash: &str) -> String {
+    match jiggle_geohash(base_geohash, JIGGLE_METERS) {
+        Ok(jiggled) => format!("nearbyGeoHash={jiggled}"),
+        Err(e) => {
+            eprintln!("[{}] geohash jiggle failed: {e}; using base", unix_now());
+            format!("nearbyGeoHash={base_geohash}")
+        }
+    }
+}
+
+fn jiggle_geohash(base: &str, max_meters: f64) -> Result<String, geohash::GeohashError> {
+    const METERS_PER_DEG_LAT: f64 = 111_320.0;
+
+    let (coord, _, _) = geohash::decode(base)?;
+
+    let bearing = rand::random_range(0.0..std::f64::consts::TAU);
+    let distance = rand::random_range(0.0..=max_meters);
+
+    let north = distance * bearing.cos();
+    let east = distance * bearing.sin();
+
+    let lat_rad = coord.y.to_radians();
+    let d_lat = north / METERS_PER_DEG_LAT;
+    let d_lon = east / (METERS_PER_DEG_LAT * lat_rad.cos().abs().max(1e-6));
+
+    let jiggled = Coord {
+        x: wrap_longitude(coord.x + d_lon),
+        y: (coord.y + d_lat).clamp(-90.0, 90.0),
+    };
+
+    geohash::encode(jiggled, base.chars().count())
+}
+
+/// Wrap a longitude in degrees into `[-180, 180)` so a jiggle across the
+/// antimeridian stays a coordinate `encode` accepts.
+fn wrap_longitude(lon: f64) -> f64 {
+    (lon + 540.0).rem_euclid(360.0) - 180.0
 }
 
 async fn run_cascade(
@@ -188,4 +233,68 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn haversine_meters(a: Coord<f64>, b: Coord<f64>) -> f64 {
+        const R: f64 = 6_371_000.0;
+        let (lat1, lat2) = (a.y.to_radians(), b.y.to_radians());
+        let d_lat = (b.y - a.y).to_radians();
+        let d_lon = (b.x - a.x).to_radians();
+        let h = (d_lat / 2.0).sin().powi(2)
+            + lat1.cos() * lat2.cos() * (d_lon / 2.0).sin().powi(2);
+        2.0 * R * h.sqrt().asin()
+    }
+
+    #[test]
+    fn jiggle_stays_within_bounds_and_varies() {
+        let base = "gcpvj0duq2yk";
+        let (origin, _, _) = geohash::decode(base).unwrap();
+
+        let mut moved = 0;
+        let mut max_dist = 0.0f64;
+        for _ in 0..10_000 {
+            let jiggled = jiggle_geohash(base, JIGGLE_METERS).unwrap();
+            assert_eq!(jiggled.chars().count(), base.chars().count());
+
+            let (point, _, _) = geohash::decode(&jiggled).unwrap();
+            let dist = haversine_meters(origin, point);
+            max_dist = max_dist.max(dist);
+            if jiggled != base {
+                moved += 1;
+            }
+        }
+
+        assert!(max_dist <= 5.5, "max displacement {max_dist} m exceeded budget");
+        assert!(moved > 9_000, "geohash rarely changed ({moved}/10000)");
+    }
+
+    #[test]
+    fn jiggle_across_antimeridian_stays_valid_and_close() {
+        // Base geohash a fraction of a meter west of +180 longitude.
+        let base = geohash::encode(Coord { x: 179.999_99, y: 0.0 }, 12).unwrap();
+        let (origin, _, _) = geohash::decode(&base).unwrap();
+
+        for _ in 0..10_000 {
+            // Never falls back to Err: the wrap keeps longitude in range.
+            let jiggled = jiggle_geohash(&base, JIGGLE_METERS).unwrap();
+            let (point, _, _) = geohash::decode(&jiggled).unwrap();
+            assert!((-180.0..180.0).contains(&point.x), "lon {} out of range", point.x);
+            assert!(
+                haversine_meters(origin, point) <= 5.5,
+                "displacement exceeded budget across antimeridian"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_longitude_maps_into_range() {
+        assert!((wrap_longitude(180.00004) - -179.99996).abs() < 1e-6);
+        assert!((wrap_longitude(-180.00004) - 179.99996).abs() < 1e-6);
+        assert_eq!(wrap_longitude(0.0), 0.0);
+        assert!((wrap_longitude(-0.09) - -0.09).abs() < 1e-9);
+    }
 }

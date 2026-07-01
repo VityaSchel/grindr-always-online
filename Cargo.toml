@@ -1,6 +1,6 @@
 [package]
 name = "grindr-always-online"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 
@@ -9,3 +9,4 @@ grindr = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 serde_json = "1"
 rand = "0.10"
+geohash = "0.13.2"
