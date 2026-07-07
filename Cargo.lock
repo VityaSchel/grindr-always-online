@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "grindr-always-online"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "geohash",
  "grindr",
