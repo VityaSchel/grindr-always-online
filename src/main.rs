@@ -93,7 +93,7 @@ fn jiggle_geohash(base: &str, max_meters: f64) -> Result<String, geohash::Geohas
     let (coord, _, _) = geohash::decode(base)?;
 
     let bearing = rand::random_range(0.0..std::f64::consts::TAU);
-    let distance = rand::random_range(0.0..=max_meters);
+    let distance = max_meters * rand::random_range(0.0..=1.0_f64).sqrt();
 
     let north = distance * bearing.cos();
     let east = distance * bearing.sin();
