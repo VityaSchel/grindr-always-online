@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let password = std::env::var("GRINDR_PASSWORD")
             .map_err(|_| "set GRINDR_PASSWORD (and GRINDR_EMAIL) to log in")?;
 
-        println!("logging in as {email} …");
+        println!("logging in …");
         client.login(&email, &password).await?;
         persist_session(&data_dir, &client);
     }
@@ -51,11 +51,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let once = std::env::args().any(|a| a == "once");
 
     loop {
-        let cascade_query = jiggled_query(&base_geohash);
+        let geohash = jiggled(&base_geohash);
 
-        match run_cascade(&client, &cascade_query).await {
+        match run_cascade(&client, &geohash).await {
             Ok(()) => {}
-            Err(e) => eprintln!("[{}] request failed: {e}", unix_now()),
+            Err(e) => eprintln!(
+                "[{}] request failed: {}",
+                unix_now(),
+                redact(&e.to_string(), &[&geohash, &base_geohash])
+            ),
         }
 
         persist_session(&data_dir, &client);
@@ -77,14 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn jiggled_query(base_geohash: &str) -> String {
-    match jiggle_geohash(base_geohash, JIGGLE_METERS) {
-        Ok(jiggled) => format!("nearbyGeoHash={jiggled}"),
-        Err(e) => {
-            eprintln!("[{}] geohash jiggle failed: {e}; using base", unix_now());
-            format!("nearbyGeoHash={base_geohash}")
-        }
-    }
+fn jiggled(base_geohash: &str) -> String {
+    jiggle_geohash(base_geohash, JIGGLE_METERS).unwrap_or_else(|_| {
+        eprintln!("[{}] geohash jiggle failed; using the base geohash", unix_now());
+        base_geohash.to_owned()
+    })
 }
 
 fn jiggle_geohash(base: &str, max_meters: f64) -> Result<String, geohash::GeohashError> {
@@ -116,27 +117,30 @@ fn wrap_longitude(lon: f64) -> f64 {
     (lon + 540.0).rem_euclid(360.0) - 180.0
 }
 
-async fn run_cascade(
-    client: &GrindrClient,
-    cascade_query: &str,
-) -> Result<(), grindr::GrindrError> {
-    let path = if cascade_query.is_empty() {
-        "/v4/cascade".to_owned()
-    } else {
-        format!("/v4/cascade?{cascade_query}")
-    };
+/// Logs only the status and size of each answer, never the location or the nearby profiles.
+async fn run_cascade(client: &GrindrClient, geohash: &str) -> Result<(), grindr::GrindrError> {
+    let path = format!("/v4/cascade?nearbyGeoHash={geohash}");
 
     let resp = client
         .request_authenticated_raw(Method::GET, &path, None)
         .await?;
 
-    let body = String::from_utf8_lossy(&resp.body);
-    let snippet: String = body.chars().take(200).collect();
-
-    println!("[{}] GET {path} -> {}", unix_now(), resp.status);
-    println!("    {snippet}");
+    println!(
+        "[{}] GET /v4/cascade -> {} ({} bytes)",
+        unix_now(),
+        resp.status,
+        resp.body.len()
+    );
 
     Ok(())
+}
+
+/// An error may quote the request URL, so the geohashes in it are hidden.
+fn redact(message: &str, hidden: &[&str]) -> String {
+    hidden
+        .iter()
+        .filter(|h| !h.is_empty())
+        .fold(message.to_owned(), |m, h| m.replace(h, "…"))
 }
 
 fn data_dir() -> Result<PathBuf, std::env::VarError> {
@@ -288,6 +292,15 @@ mod tests {
                 "displacement exceeded budget across antimeridian"
             );
         }
+    }
+
+    #[test]
+    fn redact_hides_the_geohashes() {
+        let message = "error sending request for url (https://grindr.mobi/v4/cascade?nearbyGeoHash=gcpvj0duq2yk)";
+        assert_eq!(
+            redact(message, &["gcpvj0duq2yk", ""]),
+            "error sending request for url (https://grindr.mobi/v4/cascade?nearbyGeoHash=…)"
+        );
     }
 
     #[test]
