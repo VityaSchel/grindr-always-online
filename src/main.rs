@@ -268,7 +268,7 @@ mod tests {
             }
         }
 
-        assert!(max_dist <= 5.5, "max displacement {max_dist} m exceeded budget");
+        assert!(max_dist <= JIGGLE_METERS * 1.1, "max displacement {max_dist} m exceeded budget");
         assert!(moved > 9_000, "geohash rarely changed ({moved}/10000)");
     }
 
@@ -284,7 +284,7 @@ mod tests {
             let (point, _, _) = geohash::decode(&jiggled).unwrap();
             assert!((-180.0..180.0).contains(&point.x), "lon {} out of range", point.x);
             assert!(
-                haversine_meters(origin, point) <= 5.5,
+                haversine_meters(origin, point) <= JIGGLE_METERS * 1.1,
                 "displacement exceeded budget across antimeridian"
             );
         }
