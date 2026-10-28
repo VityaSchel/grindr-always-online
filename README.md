@@ -5,18 +5,24 @@ Rust script that keeps a Grindr account always "online" by sending a `GET /v4/ca
 ## Configure
 
 1. Clone the repository or [download a release from Forgejo releases](https://git.hloth.dev/hloth/grindr-always-online/releases).
-2. Set your credentials
+2. Set your credentials. Every account type signs in with its Grindr `authToken` (the long-lived token Grindr returns at sign-in), plus the id the token belongs to:
 
 ```sh
-# Google OAuth not supported
+export GRINDR_AUTH_TOKEN="0123456789abcdef…"
+
+# Email account
 export GRINDR_EMAIL="m@example.com"
-export GRINDR_PASSWORD="yourpassword"
+
+# Google or Facebook account: the thirdPartyUserId Grindr returned with the token
+export GRINDR_THIRD_PARTY_USER_ID=""
 
 # https://geohash.softeng.co/, must be 12 characters
 export GRINDR_GEOHASH=""
 
 export GRINDR_DATA_DIR="/var/lib/grindr-always-online"
 ```
+
+Email accounts can sign in with `GRINDR_EMAIL` and `GRINDR_PASSWORD` instead of `GRINDR_AUTH_TOKEN`, unless Grindr asks that account for a captcha. Phone number accounts are not supported.
 
 Or put them into .env and load:
 
@@ -67,7 +73,10 @@ cargo run --release -- once  # fire a single request and exit
 ```
 
 The login session and device identity are cached in `session.json` and
-`device.json` in the data directory, so it only logs in on the first run.
+`device.json` in the data directory, so it only needs the credentials on the
+first run. A refresh can return a new auth token, and `session.json` always
+holds the latest one. Delete `session.json` to switch accounts or when Grindr
+ends the session.
 
 ## License
 

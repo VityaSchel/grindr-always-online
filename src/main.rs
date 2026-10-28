@@ -6,22 +6,30 @@ use std::{
 };
 
 use geohash::Coord;
-use grindr::{DeviceInfo, GrindrClient, Method, Session};
+use grindr::{
+    Credentials, DeviceInfo, GrindrClient, GrindrError, Method, Session, SessionKind, SignInResult,
+};
 
 const MIN_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const MAX_INTERVAL: Duration = Duration::from_secs(9 * 60 + 59);
 
 const JIGGLE_METERS: f64 = 5.0;
 
+const REFRESH_AHEAD: Duration = Duration::from_secs(2 * 60);
+
+const MISSING_AUTH: &str = "set GRINDR_AUTH_TOKEN with GRINDR_EMAIL (email account) or GRINDR_THIRD_PARTY_USER_ID (Google or Facebook account)";
+
+enum SignIn {
+    Resume(Credentials),
+    Password { email: String, password: String },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = data_dir()?;
     ensure_data_dir(&data_dir)?;
 
-    let base_geohash = std::env::var("GRINDR_GEOHASH")
-        .ok()
-        .filter(|g| !g.trim().is_empty())
-        .ok_or("set GRINDR_GEOHASH")?;
+    let base_geohash = env("GRINDR_GEOHASH").ok_or("set GRINDR_GEOHASH")?;
 
     let device = load_device(&data_dir).unwrap_or_else(|| {
         let d = DeviceInfo::generate();
@@ -33,25 +41,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         d
     });
 
-    let saved = load_session(&data_dir);
-    let had_session = saved.is_some();
-    let client = GrindrClient::new(device, saved)?;
+    let saved = load_credentials(&data_dir);
+    let resumed = saved.is_some();
+    let sign_in = match saved {
+        Some(credentials) => SignIn::Resume(credentials),
+        None => sign_in_from_env()?,
+    };
 
-    if !had_session {
-        let email = std::env::var("GRINDR_EMAIL")
-            .map_err(|_| "set GRINDR_EMAIL (and GRINDR_PASSWORD) to log in")?;
-        let password = std::env::var("GRINDR_PASSWORD")
-            .map_err(|_| "set GRINDR_PASSWORD (and GRINDR_EMAIL) to log in")?;
-
-        println!("logging in …");
-        client.login(&email, &password).await?;
-        persist_session(&data_dir, &client);
-    }
+    let geohash = jiggled(&base_geohash);
+    let client = start_session(device, sign_in, &geohash)
+        .await
+        .map_err(|e| {
+            let message = redact(&e.to_string(), &[&geohash, &base_geohash]);
+            if !resumed {
+                format!("could not sign in: {message}")
+            } else if is_refusal(&e) {
+                refused(&data_dir, &message)
+            } else {
+                format!(
+                    "could not resume the session saved in {}: {message}",
+                    session_path(&data_dir).display()
+                )
+            }
+        })?;
+    persist_session(&data_dir, &client)?;
 
     let once = std::env::args().any(|a| a == "once");
 
     loop {
         let geohash = jiggled(&base_geohash);
+
+        if session_expiring(&client) {
+            match client.refresh_session_at_geohash(Some(&geohash)).await {
+                Ok(result) => report_restriction(&result),
+                Err(e) => {
+                    let message = redact(&e.to_string(), &[&geohash, &base_geohash]);
+                    if is_refusal(&e) {
+                        return Err(refused(&data_dir, &message).into());
+                    }
+                    eprintln!("[{}] session refresh failed: {message}", unix_now());
+                }
+            }
+        }
 
         match run_cascade(&client, &geohash).await {
             Ok(()) => {}
@@ -62,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         }
 
-        persist_session(&data_dir, &client);
+        persist_session(&data_dir, &client)?;
 
         if once {
             break;
@@ -79,6 +110,125 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+fn sign_in_from_env() -> Result<SignIn, &'static str> {
+    let email = env("GRINDR_EMAIL");
+
+    if let Some(auth_token) = env("GRINDR_AUTH_TOKEN") {
+        return token_credentials(auth_token, email, env("GRINDR_THIRD_PARTY_USER_ID"))
+            .map(SignIn::Resume);
+    }
+
+    let password = std::env::var("GRINDR_PASSWORD")
+        .ok()
+        .filter(|p| !p.is_empty());
+
+    match (email, password) {
+        (Some(email), Some(password)) => Ok(SignIn::Password { email, password }),
+        _ => Err(MISSING_AUTH),
+    }
+}
+
+/// Email accounts refresh with the email, Google and Facebook accounts with the
+/// third-party user id; the auth token alone identifies neither.
+fn token_credentials(
+    auth_token: String,
+    email: Option<String>,
+    third_party_user_id: Option<String>,
+) -> Result<Credentials, &'static str> {
+    let (email, kind) = match &third_party_user_id {
+        Some(id) if id.starts_with("facebook") => (id.clone(), SessionKind::Facebook),
+        Some(id) => (id.clone(), SessionKind::Google),
+        None => (email.ok_or(MISSING_AUTH)?, SessionKind::Email),
+    };
+
+    Ok(Credentials {
+        email,
+        profile_id: None,
+        auth_token,
+        kind,
+        third_party_user_id,
+    })
+}
+
+async fn start_session(
+    device: DeviceInfo,
+    sign_in: SignIn,
+    geohash: &str,
+) -> Result<GrindrClient, GrindrError> {
+    let (client, result) = match sign_in {
+        SignIn::Resume(credentials) => {
+            let session = Session {
+                credentials,
+                token: None,
+            };
+            let client = GrindrClient::new(device, Some(session))?;
+            println!("refreshing the session …");
+            let result = client.refresh_session_at_geohash(Some(geohash)).await?;
+            (client, result)
+        }
+        SignIn::Password { email, password } => {
+            let client = GrindrClient::new(device, None)?;
+            println!("signing in …");
+            let result = client
+                .sign_in_with_email_at_geohash(&email, &password, Some(geohash))
+                .await?;
+            (client, result)
+        }
+    };
+
+    report_restriction(&result);
+
+    Ok(client)
+}
+
+fn report_restriction(result: &SignInResult) {
+    if let Some(restriction) = &result.restriction {
+        eprintln!(
+            "[{}] the account is restricted: {restriction:?}",
+            unix_now()
+        );
+    }
+}
+
+/// Refreshing before the library's lazy refresh surfaces the real error; the
+/// lazy one keeps a session the server refused and only logs it.
+fn session_expiring(client: &GrindrClient) -> bool {
+    let expires_at = client
+        .session_receiver()
+        .borrow()
+        .as_ref()
+        .and_then(|s| s.token.as_ref())
+        .map(|t| t.expires_at);
+
+    expires_at.is_none_or(|at| at <= unix_now() + REFRESH_AHEAD.as_secs())
+}
+
+/// A rejected token comes back as a `403` with code 4 rather than a `401`, and
+/// code 8 means this client version is no longer accepted.
+fn is_refusal(e: &GrindrError) -> bool {
+    matches!(
+        e,
+        GrindrError::Unauthorized { .. }
+            | GrindrError::Banned(_)
+            | GrindrError::Auth(_)
+            | GrindrError::Api { code: 4 | 8, .. }
+    )
+}
+
+fn refused(data_dir: &Path, reason: &str) -> String {
+    format!(
+        "Grindr refused the session ({reason}); if the token is no longer valid, delete {} and set GRINDR_AUTH_TOKEN",
+        session_path(data_dir).display()
+    )
 }
 
 fn jiggled(base_geohash: &str) -> String {
@@ -118,12 +268,10 @@ fn wrap_longitude(lon: f64) -> f64 {
 }
 
 /// Logs only the status and size of each answer, never the location or the nearby profiles.
-async fn run_cascade(client: &GrindrClient, geohash: &str) -> Result<(), grindr::GrindrError> {
+async fn run_cascade(client: &GrindrClient, geohash: &str) -> Result<(), GrindrError> {
     let path = format!("/v4/cascade?nearbyGeoHash={geohash}");
 
-    let resp = client
-        .request_authenticated_raw(Method::GET, &path, None)
-        .await?;
+    let resp = client.request(Method::GET, &path).send().await?;
 
     println!(
         "[{}] GET /v4/cascade -> {} ({} bytes)",
@@ -171,10 +319,21 @@ fn ensure_data_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn persist_session(data_dir: &Path, client: &GrindrClient) {
-    if let Some(session) = client.session_receiver().borrow().clone() {
-        save_session(data_dir, &session);
-    }
+/// A sign-in or refresh can return a new auth token, so the latest one is
+/// saved after each of them.
+fn persist_session(data_dir: &Path, client: &GrindrClient) -> Result<(), String> {
+    let credentials = client
+        .session_receiver()
+        .borrow()
+        .as_ref()
+        .map(|s| s.credentials.clone());
+
+    let Some(credentials) = credentials else {
+        return Err(refused(data_dir, "signed out"));
+    };
+
+    save_credentials(data_dir, &credentials);
+    Ok(())
 }
 
 fn load_device(data_dir: &Path) -> Option<DeviceInfo> {
@@ -190,12 +349,12 @@ fn save_device(data_dir: &Path, device: &DeviceInfo) {
     }
 }
 
-fn load_session(data_dir: &Path) -> Option<Session> {
+fn load_credentials(data_dir: &Path) -> Option<Credentials> {
     serde_json::from_slice(&fs::read(session_path(data_dir)).ok()?).ok()
 }
 
-fn save_session(data_dir: &Path, session: &Session) {
-    match serde_json::to_vec_pretty(session) {
+fn save_credentials(data_dir: &Path, credentials: &Credentials) {
+    match serde_json::to_vec_pretty(credentials) {
         Ok(bytes) => {
             let _ = write_secure_file(&session_path(data_dir), &bytes);
         }
@@ -300,6 +459,63 @@ mod tests {
         assert_eq!(
             redact(message, &["gcpvj0duq2yk", ""]),
             "error sending request for url (https://grindr.mobi/v4/cascade?nearbyGeoHash=…)"
+        );
+    }
+
+    #[test]
+    fn session_saved_by_grindr_0_2_still_loads() {
+        let saved = r#"{
+            "email": "m@example.com",
+            "expires_at": 1781234567,
+            "profile_id": "123456789",
+            "session_id": "header.payload.signature",
+            "auth_token": "0123456789abcdef",
+            "kind": "Email",
+            "third_party_user_id": null
+        }"#;
+
+        let credentials: Credentials = serde_json::from_str(saved).unwrap();
+        assert_eq!(credentials.email, "m@example.com");
+        assert_eq!(credentials.profile_id.as_deref(), Some("123456789"));
+        assert_eq!(credentials.auth_token, "0123456789abcdef");
+        assert_eq!(credentials.kind, SessionKind::Email);
+        assert_eq!(credentials.third_party_user_id, None);
+    }
+
+    #[test]
+    fn token_with_email_resumes_an_email_account() {
+        let credentials =
+            token_credentials("tok".into(), Some("m@example.com".into()), None).unwrap();
+        assert_eq!(credentials.kind, SessionKind::Email);
+        assert_eq!(credentials.email, "m@example.com");
+        assert_eq!(credentials.auth_token, "tok");
+        assert_eq!(credentials.third_party_user_id, None);
+    }
+
+    #[test]
+    fn token_with_third_party_id_resumes_a_google_or_facebook_account() {
+        let google = token_credentials(
+            "tok".into(),
+            Some("m@example.com".into()),
+            Some("1170".into()),
+        )
+        .unwrap();
+        assert_eq!(google.kind, SessionKind::Google);
+        assert_eq!(google.third_party_user_id.as_deref(), Some("1170"));
+
+        let facebook = token_credentials("tok".into(), None, Some("facebook1221".into())).unwrap();
+        assert_eq!(facebook.kind, SessionKind::Facebook);
+        assert_eq!(
+            facebook.third_party_user_id.as_deref(),
+            Some("facebook1221")
+        );
+    }
+
+    #[test]
+    fn token_without_an_account_id_is_refused() {
+        assert_eq!(
+            token_credentials("tok".into(), None, None).err(),
+            Some(MISSING_AUTH)
         );
     }
 
